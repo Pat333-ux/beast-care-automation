@@ -1,0 +1,24 @@
+beast-care-automation/
+├── README.md
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+├── alembic.ini
+├── src/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── models.py
+│   ├── database.py
+│   ├── main.py
+│   ├── orchestrator.py
+│   ├── scraper.py
+│   ├── ocr_pipeline.py
+│   ├── dispatcher.py
+│   └── worker.py          <-- Added background task queue
+├── migrations/
+│   └── env.py
+└── tests/
+    ├── __init__.py
+    ├── test_orchestrator.py
+    └── test_dispatcher.py
