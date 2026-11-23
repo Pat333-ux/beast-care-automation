@@ -1,0 +1,58 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: beast-care-automation
+  labels:
+    cloud.googleapis.com/location: us-central1
+    system: beast-3-0
+    division: care-automation
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "10"
+        run.googleapis.com/client-name: gcloud
+        run.googleapis.com/cloudsql-instances: "beast-system-511916:us-central1:beast-care-db"
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      serviceAccountName: beast-care-sa@beast-system-511916.iam.gserviceaccount.com
+      containers:
+        - image: us-central1-docker.pkg.dev/beast-system-511916/beast-care-repo/beast-care-automation:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "1000m"
+              memory: 512Mi
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: beast-care-db-url
+                  key: latest
+            - name: CARE_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: beast-care-webhook-secret
+                  key: latest
+            - name: DIV19_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: beast-care-div19-secret
+                  key: latest
+            - name: DIV19_EMERGENCY_ENDPOINT
+              value: "https://div19-emergency-uc.a.run.app/v1/circuit-breaker"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 15
