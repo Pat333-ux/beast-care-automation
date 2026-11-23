@@ -25,7 +25,6 @@ from src.models import (
 )
 from src.observability import get_logger
 from src.persistence import (
-    Base,
     BenefitApplicationORM,
     CareCaseORM,
     save_application_and_audit,
@@ -33,13 +32,13 @@ from src.persistence import (
     save_dispatch_attempt,
 )
 from src.scraper import BenefitCatalogSyncEngine
+from src.security import generate_hmac_signature
 
-app = FastAPI(title="BEAST Care Automation", version="0.4.0")
+app = FastAPI(title="BEAST Care Automation", version="0.5.0")
 care_orchestrator = CareOrchestrator()
 engine_core = BeastAutonomousCaretakerEngine()
 scraper = BenefitCatalogSyncEngine()
 logger = get_logger("beast.api")
-# Keep the historical dependency name available to existing API clients/tests.
 get_db = get_db_session
 
 
@@ -49,12 +48,9 @@ def on_startup() -> None:
 
 
 def sign_handoff_payload(payload: dict[str, object], secret: str | None = None) -> str:
-    signing_secret = secret or os.getenv("CARE_WEBHOOK_SECRET")
-    if not signing_secret or signing_secret == "dev-change-me-in-secret-manager":
-        raise RuntimeError("CARE_WEBHOOK_SECRET must be configured with a non-default secret")
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    digest = hmac.new(signing_secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
-    return f"sha256={digest}"
+    """Compatibility helper returning the legacy digest representation."""
+    signature_header, _ = generate_hmac_signature(payload, secret=secret)
+    return "sha256=" + signature_header.split("v1=", 1)[1]
 
 
 class HealthResponse(BaseModel):
@@ -83,6 +79,8 @@ class DispatchEndpointResponse(BaseModel):
     retryable: bool
     detail: str
     signature_sha256: str
+    signature_header: str
+    signature_timestamp: int
     safe_payload: dict[str, object]
 
 
@@ -157,8 +155,9 @@ def prepare_and_dispatch_case(case_id: str, req: DispatchRequest, db: Session = 
             care_orchestrator.prepare_application_for_dispatch(case, app_record, reviewer_id=req.reviewer_id, review_reason=req.review_reason)
         outbound = case.intake.to_safe_handoff_dict()
         outbound.update({"application_id": app_record.application_id, "program_code": app_record.program_code})
-        signature = sign_handoff_payload(outbound)
-        result: DispatchResult = care_orchestrator.dispatch_application(case, app_record, lambda payload: sender(payload, signature))
+        signature_header, signature_timestamp = generate_hmac_signature(outbound)
+        digest = signature_header.split("v1=", 1)[1]
+        result: DispatchResult = care_orchestrator.dispatch_application(case, app_record, lambda payload: sender(payload, signature_header))
         if result.dispatched:
             app_record.retry.attempt_count += 1
             app_record.retry.last_attempted_at = app_record.updated_at
@@ -167,7 +166,7 @@ def prepare_and_dispatch_case(case_id: str, req: DispatchRequest, db: Session = 
         save_dispatch_attempt(db, app_record, error=None if result.dispatched else app_record.retry.last_error)
         db.commit()
         logger.info("application_dispatch_finished", extra={"case_id": case_id, "application_id": result.application_id, "application_status": result.status.value, "dispatched": result.dispatched, "retryable": result.retryable})
-        return DispatchEndpointResponse(application_id=result.application_id, status=result.status, dispatched=result.dispatched, retryable=result.retryable, detail=result.detail, signature_sha256=signature, safe_payload=result.safe_payload)
+        return DispatchEndpointResponse(application_id=result.application_id, status=result.status, dispatched=result.dispatched, retryable=result.retryable, detail=result.detail, signature_sha256=f"sha256={digest}", signature_header=signature_header, signature_timestamp=signature_timestamp, safe_payload=result.safe_payload)
     except (InvalidStateTransitionError, DispatchAuthorizationError) as exc:
         db.rollback()
         logger.warning("application_dispatch_blocked", extra={"case_id": case_id, "application_id": req.application_id, "reason": str(exc)})
