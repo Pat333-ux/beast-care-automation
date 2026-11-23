@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from orchestrator import BeastAutonomousCaretakerEngine, CareOrchestrator, DispatchResult
 from src.db import engine, get_db_session, init_schema
+from src.emergency_bridge import EmergencyDispatchResult, dispatch_to_div19
 from src.models import (
     ApplicationStatus,
     BenefitApplicationRecord,
@@ -34,7 +35,7 @@ from src.persistence import (
 from src.scraper import BenefitCatalogSyncEngine
 from src.security import generate_hmac_signature
 
-app = FastAPI(title="BEAST Care Automation", version="0.5.0")
+app = FastAPI(title="BEAST Care Automation", version="0.6.0")
 care_orchestrator = CareOrchestrator()
 engine_core = BeastAutonomousCaretakerEngine()
 scraper = BenefitCatalogSyncEngine()
@@ -63,6 +64,7 @@ class EvaluateIntakeResponse(BaseModel):
     missing_fields: list[str]
     leads: list[BenefitLead]
     handoff_summary: dict[str, object]
+    emergency_dispatch: EmergencyDispatchResult | None = None
 
 
 class DispatchRequest(BaseModel):
@@ -89,6 +91,11 @@ def get_downstream_sender() -> Callable[[dict[str, object], str], None]:
     def unavailable_sender(_payload: dict[str, object], _signature: str) -> None:
         raise RuntimeError("Downstream sender is not configured")
     return unavailable_sender
+
+
+def get_emergency_sender() -> Callable[[dict[str, Any], str], None] | None:
+    """Return no transport by default; configure a Division 19 adapter explicitly."""
+    return None
 
 
 def _load_case_record(db: Session, case_id: str) -> CareCaseRecord:
@@ -133,13 +140,25 @@ def health() -> HealthResponse:
 
 
 @app.post("/evaluate", response_model=EvaluateIntakeResponse, status_code=status.HTTP_200_OK)
-def evaluate_intake(payload: CareIntakePayload, db: Session = Depends(get_db)) -> EvaluateIntakeResponse:
+def evaluate_intake(
+    payload: CareIntakePayload,
+    db: Session = Depends(get_db),
+    emergency_sender: Callable[[dict[str, Any], str], None] | None = Depends(get_emergency_sender),
+) -> EvaluateIntakeResponse:
     try:
         case = care_orchestrator.evaluate_case(payload)
         save_case_and_audit(db, case)
         db.commit()
+        emergency_result = None
+        if case.status == CaseStatus.ESCALATED:
+            emergency_result = dispatch_to_div19(
+                case,
+                reason="Crisis urgency detected during intake screening",
+                transport_sender=emergency_sender,
+            )
+            logger.info("emergency_escalation_attempted", extra={"case_id": case.intake.case_id, "event_id": emergency_result.event_id, "dispatched": emergency_result.dispatched})
         logger.info("care_case_evaluated", extra={"case_id": case.intake.case_id, "case_status": case.status.value, "missing_field_count": len(payload.compute_missing_fields())})
-        return EvaluateIntakeResponse(case_id=case.intake.case_id, status=case.status, missing_fields=payload.compute_missing_fields(), leads=case.leads, handoff_summary=payload.to_safe_handoff_dict())
+        return EvaluateIntakeResponse(case_id=case.intake.case_id, status=case.status, missing_fields=payload.compute_missing_fields(), leads=case.leads, handoff_summary=payload.to_safe_handoff_dict(), emergency_dispatch=emergency_result)
     except Exception:
         db.rollback()
         logger.exception("care_case_evaluation_failed", extra={"case_id": payload.case_id})
@@ -157,7 +176,7 @@ def prepare_and_dispatch_case(case_id: str, req: DispatchRequest, db: Session = 
         outbound.update({"application_id": app_record.application_id, "program_code": app_record.program_code})
         signature_header, signature_timestamp = generate_hmac_signature(outbound)
         digest = signature_header.split("v1=", 1)[1]
-        result: DispatchResult = care_orchestrator.dispatch_application(case, app_record, lambda payload: sender(payload, signature_header))
+        result: DispatchResult = care_orchestrator.dispatch_application(case, app_record, lambda safe_payload: sender(safe_payload, signature_header))
         if result.dispatched:
             app_record.retry.attempt_count += 1
             app_record.retry.last_attempted_at = app_record.updated_at
