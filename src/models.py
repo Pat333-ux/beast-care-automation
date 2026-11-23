@@ -5,7 +5,7 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 
 def utc_now() -> datetime:
@@ -36,8 +36,7 @@ class CaseStatus(str, Enum):
 
 
 class ApplicationStatus(str, Enum):
-    # Legacy screening values remain available while callers migrate to the
-    # explicit application lifecycle below. They are never dispatch approval.
+    # Legacy screening values are retained for existing API/catalog callers.
     IDENTIFIED = "IDENTIFIED"
     DOCUMENTS_PENDING = "DOCUMENTS_PENDING"
     READY_FOR_SUBMISSION = "READY_FOR_SUBMISSION"
@@ -78,7 +77,7 @@ class InvalidStateTransitionError(ValueError):
 
 
 class DispatchAuthorizationError(PermissionError):
-    """Raised when dispatch readiness lacks an explicit reviewer approval."""
+    """Raised when dispatch readiness lacks required consent or reviewer approval."""
 
 
 class TransitionAuditEntry(BaseModel):
@@ -111,14 +110,18 @@ class CareIntakePayload(BaseModel):
     verified_documents: list[str] = Field(default_factory=list)
     missing_fields: list[str] = Field(default_factory=list)
     notes: str | None = Field(default=None, max_length=1000)
+    _date_of_birth_on_file: bool = PrivateAttr(default=False)
+
+    def model_post_init(self, __context: Any) -> None:
+        self._date_of_birth_on_file = bool(self.date_of_birth)
 
     @field_validator("case_id", "household_id")
     @classmethod
     def validate_non_blank_id(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
+        cleaned = value.strip()
+        if not cleaned:
             raise ValueError("Identifier must not be blank")
-        return value
+        return cleaned
 
     @field_validator("date_of_birth")
     @classmethod
@@ -134,13 +137,14 @@ class CareIntakePayload(BaseModel):
 
     def compute_missing_fields(self) -> list[str]:
         missing = list(dict.fromkeys(item.strip() for item in self.missing_fields if item.strip()))
-        for field_name, absent in (("date_of_birth", not self.date_of_birth), ("recipient_authorized", not self.recipient_authorized)):
-            if absent and field_name not in missing:
-                missing.append(field_name)
+        if not self.date_of_birth and not self._date_of_birth_on_file and "date_of_birth" not in missing:
+            missing.append("date_of_birth")
+        if not self.recipient_authorized and "recipient_authorized" not in missing:
+            missing.append("recipient_authorized")
         return missing
 
     def to_safe_handoff_dict(self) -> dict[str, Any]:
-        """Return a minimized payload; exclude name, birth date, and free-text notes."""
+        """Return a minimized payload without applicant name, birth date, or free-text notes."""
         return {
             "case_id": self.case_id,
             "household_id": self.household_id,
@@ -219,7 +223,7 @@ class BenefitApplicationRecord(BaseModel):
             self.audit_log.append(TransitionAuditEntry(entity_type="application", entity_id=self.application_id, from_status=self.status.value, to_status=self.status.value, actor=actor, reason=f"Retry attempt {self.retry.attempt_count} failed: {error}", occurred_at=now))
 
 
-# Shared benefit-screening contracts retained for the existing catalog/orchestrator.
+# Shared legacy benefit-catalog contracts, imported by scraper and evaluation routes.
 class CareRecipientProfile(BaseModel):
     recipient_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     full_name: str

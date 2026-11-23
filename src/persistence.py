@@ -17,6 +17,8 @@ class CareCaseORM(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     urgency: Mapped[str] = mapped_column(String(16), nullable=False)
     recipient_authorized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    date_of_birth_on_file: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    verified_documents: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     missing_fields: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     safe_payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -84,10 +86,21 @@ def _save_audits(session: Session, entries: list[TransitionAuditEntry]) -> None:
 
 
 def save_case_and_audit(session: Session, case: CareCaseRecord) -> CareCaseORM:
-    row = session.get(CareCaseORM, case.intake.case_id)
-    values = dict(household_id=case.intake.household_id, status=case.status.value, urgency=case.intake.urgency.value, recipient_authorized=case.intake.recipient_authorized, missing_fields=case.intake.compute_missing_fields(), safe_payload=case.intake.to_safe_handoff_dict(), updated_at=case.updated_at)
+    intake = case.intake
+    row = session.get(CareCaseORM, intake.case_id)
+    values = {
+        "household_id": intake.household_id,
+        "status": case.status.value,
+        "urgency": intake.urgency.value,
+        "recipient_authorized": intake.recipient_authorized,
+        "date_of_birth_on_file": bool(intake.date_of_birth) or intake._date_of_birth_on_file,
+        "verified_documents": list(intake.verified_documents),
+        "missing_fields": intake.compute_missing_fields(),
+        "safe_payload": intake.to_safe_handoff_dict(),
+        "updated_at": case.updated_at,
+    }
     if row is None:
-        row = CareCaseORM(case_id=case.intake.case_id, **values)
+        row = CareCaseORM(case_id=intake.case_id, **values)
         session.add(row)
     else:
         for key, value in values.items():
@@ -99,7 +112,18 @@ def save_case_and_audit(session: Session, case: CareCaseRecord) -> CareCaseORM:
 
 def save_application_and_audit(session: Session, app_record: BenefitApplicationRecord) -> BenefitApplicationORM:
     row = session.get(BenefitApplicationORM, app_record.application_id)
-    values = dict(case_id=app_record.case_id, program_code=app_record.program_code, status=app_record.status.value, human_review_approved=app_record.human_review_approved, attempt_count=app_record.retry.attempt_count, max_attempts=app_record.retry.max_attempts, retryable=app_record.retry.retryable, last_error=app_record.retry.last_error, last_attempted_at=app_record.retry.last_attempted_at, updated_at=app_record.updated_at)
+    values = {
+        "case_id": app_record.case_id,
+        "program_code": app_record.program_code,
+        "status": app_record.status.value,
+        "human_review_approved": app_record.human_review_approved,
+        "attempt_count": app_record.retry.attempt_count,
+        "max_attempts": app_record.retry.max_attempts,
+        "retryable": app_record.retry.retryable,
+        "last_error": app_record.retry.last_error,
+        "last_attempted_at": app_record.retry.last_attempted_at,
+        "updated_at": app_record.updated_at,
+    }
     if row is None:
         row = BenefitApplicationORM(application_id=app_record.application_id, **values)
         session.add(row)
@@ -112,7 +136,15 @@ def save_application_and_audit(session: Session, app_record: BenefitApplicationR
 
 
 def save_dispatch_attempt(session: Session, app_record: BenefitApplicationRecord, *, error: str | None, next_retry_at: datetime | None = None) -> DispatchAttemptORM:
-    attempt = DispatchAttemptORM(application_id=app_record.application_id, attempt_number=app_record.retry.attempt_count, attempted_at=app_record.retry.last_attempted_at or app_record.updated_at, error=error, retryable=app_record.retry.retryable, next_retry_at=next_retry_at)
+    attempt_number = max(1, app_record.retry.attempt_count)
+    attempt = DispatchAttemptORM(
+        application_id=app_record.application_id,
+        attempt_number=attempt_number,
+        attempted_at=app_record.retry.last_attempted_at or app_record.updated_at,
+        error=error,
+        retryable=app_record.retry.retryable,
+        next_retry_at=next_retry_at,
+    )
     session.add(attempt)
     session.flush()
     return attempt
