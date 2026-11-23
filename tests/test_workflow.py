@@ -48,19 +48,19 @@ def test_incomplete_intake_tracks_missing_fields_and_redacts_pii() -> None:
 
 
 def test_application_requires_human_review_and_records_retry_without_submitting() -> None:
-    app_record = BenefitApplicationRecord(application_id="APP-501", case_id="CASE-101", program_code="FSSA-PATHWAY")
-    app_record.transition_to(ApplicationStatus.PENDING_REVIEW, actor="system", reason="Queued")
+    app_rec = BenefitApplicationRecord(application_id="APP-501", case_id="CASE-101", program_code="FSSA-PATHWAY")
+    app_rec.transition_to(ApplicationStatus.PENDING_REVIEW, actor="system", reason="Queued")
     try:
-        app_record.transition_to(ApplicationStatus.READY_FOR_DISPATCH, actor="dispatcher", reason="Attempt before review")
+        app_rec.transition_to(ApplicationStatus.READY_FOR_DISPATCH, actor="dispatcher", reason="Attempt before review")
         assert False, "Expected DispatchAuthorizationError"
     except DispatchAuthorizationError:
-        assert app_record.status == ApplicationStatus.PENDING_REVIEW
-    app_record.human_review_approved = True
-    app_record.transition_to(ApplicationStatus.READY_FOR_DISPATCH, actor="case_worker", reason="Approved after verification")
-    app_record.record_retryable_failure(error="503 downstream timeout")
-    assert app_record.status == ApplicationStatus.RETRYABLE_FAILURE
-    assert app_record.status != ApplicationStatus.SUBMITTED
-    assert app_record.retry.attempt_count == 1 and app_record.retry.retryable
+        assert app_rec.status == ApplicationStatus.PENDING_REVIEW
+    app_rec.human_review_approved = True
+    app_rec.transition_to(ApplicationStatus.READY_FOR_DISPATCH, actor="case_worker", reason="Approved after verification")
+    app_rec.record_retryable_failure(error="503 downstream timeout")
+    assert app_rec.status == ApplicationStatus.RETRYABLE_FAILURE
+    assert app_rec.status != ApplicationStatus.SUBMITTED
+    assert app_rec.retry.attempt_count == 1 and app_rec.retry.retryable
 
 
 def test_persistence_and_fastapi_evaluate_route() -> None:
@@ -72,12 +72,15 @@ def test_persistence_and_fastapi_evaluate_route() -> None:
         with session_local() as session:
             yield session
 
-    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[app.dependency_overrides.get] = override_get_db if False else override_get_db
+    # The route dependency is the alias imported into src.main; override the same callable.
+    from src.main import get_db as main_get_db
+    app.dependency_overrides[main_get_db] = override_get_db
     try:
         client = TestClient(app)
-        response = client.post("/evaluate", json={"case_id": "CASE-300", "household_id": "HH-300", "applicant_name": "Test Applicant", "date_of_birth": "1990-01-15", "household_size": 2, "monthly_income_usd": 1800.0, "recipient_authorized": True})
-        assert response.status_code == 200, response.text
-        body = response.json()
+        resp = client.post("/evaluate", json={"case_id": "CASE-300", "household_id": "HH-300", "applicant_name": "Test Applicant", "date_of_birth": "1990-01-15", "household_size": 2, "monthly_income_usd": 1800.0, "recipient_authorized": True, "verified_documents": ["id_card", "income_stub", "residency_lease"]})
+        assert resp.status_code == 200
+        body = resp.json()
         assert body["status"] == "under_review"
         assert body["missing_fields"] == []
         assert "applicant_name" not in body["handoff_summary"]
@@ -86,13 +89,12 @@ def test_persistence_and_fastapi_evaluate_route() -> None:
             case = CareCaseRecord(intake=make_intake("CASE-301", "HH-301", applicant_name="Persisted Applicant"))
             case.transition_to(CaseStatus.UNDER_REVIEW, actor="api", reason="Initial evaluation")
             save_case_and_audit(session, case)
-            app_record = BenefitApplicationRecord(application_id="APP-301", case_id="CASE-301", program_code="LOCAL-CARE", human_review_approved=True)
-            app_record.transition_to(ApplicationStatus.PENDING_REVIEW, actor="api", reason="Created")
-            app_record.transition_to(ApplicationStatus.READY_FOR_DISPATCH, actor="reviewer", reason="Approved")
-            save_application_and_audit(session, app_record)
+            app_rec = BenefitApplicationRecord(application_id="APP-301", case_id="CASE-301", program_code="LOCAL-CARE", human_review_approved=True)
+            app_rec.transition_to(ApplicationStatus.PENDING_REVIEW, actor="api", reason="Created")
+            app_rec.transition_to(ApplicationStatus.READY_FOR_DISPATCH, actor="reviewer", reason="Approved")
+            save_application_and_audit(session, app_rec)
             session.commit()
-            audits = session.scalars(select(TransitionAuditORM)).all()
-            assert len(audits) == 3
+            assert len(session.scalars(select(TransitionAuditORM)).all()) == 3
     finally:
         app.dependency_overrides.clear()
         test_engine.dispose()
